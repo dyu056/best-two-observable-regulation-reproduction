@@ -14,6 +14,8 @@ trajectory-regulation trial from an exhaustive observable-pair sweep.
 | Sweep row | 404 |
 | Seed | 42 |
 
+The published winning run and its reproduction artifacts were generated on a single **NVIDIA H200 GPU**.
+
 The winning pair is:
 
 1. `val.layer_2.attn_out.l1`
