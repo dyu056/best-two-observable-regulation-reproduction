@@ -1,4 +1,5 @@
 torch>=2.7
+matplotlib
 pyarrow
 requests
 rustbpe

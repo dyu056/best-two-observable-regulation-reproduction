@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Reproduce the best completed two-observable trial (anchor-1 row 404).
-
-The script launches the bundled training source with the exact seed, step count,
-trajectory targets, coefficients, lead, and cutoff used by the winning sweep
-trial.  It deliberately writes into a fresh work directory so generated files
-cannot affect a later rerun.
-"""
+"""Reproduce the unregularized baseline used for pair-sweep comparison."""
 from __future__ import annotations
 
 import argparse
@@ -15,23 +9,22 @@ import shutil
 import subprocess
 from pathlib import Path
 
-
 SOURCE_FILES = ("train.py", "lib.py", "observable.py", "prepare.py", "data_split.json")
 
 
 def main() -> None:
-    bundle = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser()
     parser.add_argument("--python", default="python3")
-    parser.add_argument("--gpu", default="1")
-    parser.add_argument("--output-dir", type=Path, default=bundle / "rerun")
+    parser.add_argument("--gpu", default="0")
+    parser.add_argument("--output-dir", type=Path, default=root / "rerun")
     args = parser.parse_args()
 
     output = args.output_dir.resolve()
     work = output / "work"
     work.mkdir(parents=True, exist_ok=True)
     for name in SOURCE_FILES:
-        shutil.copy2(bundle / name, work / name)
+        shutil.copy2(root / name, work / name)
     shutil.rmtree(work / "run_artifacts", ignore_errors=True)
     shutil.rmtree(work / "observable_csv", ignore_errors=True)
 
@@ -41,28 +34,12 @@ def main() -> None:
             "CUDA_VISIBLE_DEVICES": args.gpu,
             "MAX_TRAIN_STEPS": "2000",
             "SEED": "42",
-            "LR_SCALE": "1.0",
+            "ATTN_BACKEND": "sdpa",
             "WEIGHT_NORM_TARGET_REG": "0",
-            "MLP_L2_GROWTH_REG": "0",
-            "ATTN_V_HEAD_L2_GROWTH_REG": "0",
-            "ATTN_QKV_HEAD_L2_GROWTH_REG": "0",
-            "ATTN_ENTROPY_REG": "0",
-            "OBSERVE_LAYER_PROBES": "0",
-            "OBSERVE_REST100_ATTENTION_HEAD_L2": "0",
+            "OBSERVE_LAYER_PROBES": "1",
+            "OBSERVE_REST100_ATTENTION_HEAD_L2": "1",
             "OBSERVE_HESSIAN_EIGENVALUES": "0",
-            "WRITE_OBSERVABLE_ARTIFACTS": "0",
-            "WRITE_OBSERVABLE_PLOTS": "0",
             "PRINT_OBSERVABLE_LINES": "0",
-            "TRAJECTORY_REG_OBSERVABLE": "val.layer_2.attn_out.l1",
-            "TRAJECTORY_REG_CURVE_FILE": str(bundle / "curves" / "val.layer_2.attn_out.l1.csv"),
-            "TRAJECTORY_REG_MODE": "trajectory",
-            "TRAJECTORY_REG_COEF": "0.01",
-            "TRAJECTORY_REG_OBSERVABLE_2": "train.layer_0.k.l1",
-            "TRAJECTORY_REG_CURVE_FILE_2": str(bundle / "curves" / "train.layer_0.k.l1.csv"),
-            "TRAJECTORY_REG_MODE_2": "trajectory",
-            "TRAJECTORY_REG_COEF_2": "0.01",
-            "TRAJECTORY_REG_UNTIL_STEP": "750",
-            "TRAJECTORY_REG_LEAD_STEPS": "100",
         }
     )
 

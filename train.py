@@ -17,10 +17,8 @@ import gc
 import csv
 import json
 import math
-import re
 import shutil
 import time
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -131,84 +129,6 @@ from observable import OBS, build_step_observables, format_observable_line  # no
 
 RUN_ARTIFACT_DIR = Path("run_artifacts")
 OBSERVABLE_CSV_DIR = Path("observable_csv")
-WRITE_OBSERVABLE_ARTIFACTS = os.environ.get("WRITE_OBSERVABLE_ARTIFACTS", "1") == "1"
-WRITE_OBSERVABLE_PLOTS = os.environ.get("WRITE_OBSERVABLE_PLOTS", "1") == "1"
-
-TRAJECTORY_REG_OBSERVABLE = os.environ.get("TRAJECTORY_REG_OBSERVABLE", "").strip()
-TRAJECTORY_REG_CURVE_FILE = os.environ.get("TRAJECTORY_REG_CURVE_FILE", "").strip()
-TRAJECTORY_REG_MODE = os.environ.get("TRAJECTORY_REG_MODE", "trajectory").strip()
-TRAJECTORY_REG_COEF = float(os.environ.get("TRAJECTORY_REG_COEF", "0.01"))
-TRAJECTORY_REG_UNTIL_STEP = int(os.environ.get("TRAJECTORY_REG_UNTIL_STEP", "750"))
-TRAJECTORY_REG_LEAD_STEPS = int(os.environ.get("TRAJECTORY_REG_LEAD_STEPS", "100"))
-TRAJECTORY_REG_OBSERVABLE_2 = os.environ.get("TRAJECTORY_REG_OBSERVABLE_2", "").strip()
-TRAJECTORY_REG_CURVE_FILE_2 = os.environ.get("TRAJECTORY_REG_CURVE_FILE_2", "").strip()
-TRAJECTORY_REG_MODE_2 = os.environ.get("TRAJECTORY_REG_MODE_2", "trajectory").strip()
-TRAJECTORY_REG_COEF_2 = float(os.environ.get("TRAJECTORY_REG_COEF_2", "0.01"))
-
-
-def _canonical_reg_observable(name):
-    for prefix in ("train.", "val."):
-        if name.startswith(prefix):
-            return name[len(prefix):]
-    return name
-
-
-class _TrajectoryRegCapture:
-    """Hold the one differentiable activation selected for this trial."""
-
-    def __init__(self, observable):
-        self.observable = _canonical_reg_observable(observable)
-        self.value = None
-
-    @property
-    def enabled(self):
-        return bool(self.observable) and self.observable.startswith("layer_")
-
-    def clear(self):
-        self.value = None
-
-    def wants(self, name):
-        return self.enabled and self.observable == _canonical_reg_observable(name)
-
-    def wants_layer(self, layer_idx):
-        return self.enabled and self.observable.startswith(f"layer_{layer_idx}.")
-
-    def add(self, name, value):
-        if self.wants(name):
-            self.value = value.float().mean() if value.ndim else value.float()
-
-    def add_norms(self, prefix, tensor):
-        if self.wants(f"{prefix}.l1"):
-            self.value = tensor.float().abs().sum()
-        elif self.wants(f"{prefix}.l2"):
-            self.value = tensor.float().square().sum().clamp_min(1e-12).sqrt()
-        elif self.wants(f"{prefix}.abs_max"):
-            self.value = tensor.float().abs().max()
-
-
-REG_CAPTURE = _TrajectoryRegCapture(TRAJECTORY_REG_OBSERVABLE)
-REG_CAPTURE_2 = _TrajectoryRegCapture(TRAJECTORY_REG_OBSERVABLE_2)
-REG_CAPTURES = (REG_CAPTURE, REG_CAPTURE_2)
-ATTENTION_ENTROPY_REG_VALUES = []
-ATTENTION_ENTROPY_REG_CAPTURE_ACTIVE = False
-
-
-def _load_trajectory_targets(path):
-    if not path:
-        return [], 1.0
-    rows = []
-    with Path(path).open(newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            rows.append(float(row["value"]))
-    if not rows:
-        raise ValueError(f"Trajectory regularizer curve is empty: {path}")
-    finite = torch.tensor(rows, dtype=torch.float64)
-    scale = max(float(finite.std().item()), float(finite.abs().median().item()) * 0.05, 1e-6)
-    return rows, scale
-
-
-TRAJECTORY_REG_TARGETS, TRAJECTORY_REG_SCALE = _load_trajectory_targets(TRAJECTORY_REG_CURVE_FILE)
-TRAJECTORY_REG_TARGETS_2, TRAJECTORY_REG_SCALE_2 = _load_trajectory_targets(TRAJECTORY_REG_CURVE_FILE_2)
 
 
 def write_observable_artifacts(summary):
@@ -216,24 +136,19 @@ def write_observable_artifacts(summary):
     RUN_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     metadata = {"summary": summary}
 
+    csv_dir = RUN_ARTIFACT_DIR / f"rsi_observable_csv_{stamp}"
+    latest_csv_dir = RUN_ARTIFACT_DIR / "latest_rsi_observable_csv"
+    for output in (csv_dir, latest_csv_dir, OBSERVABLE_CSV_DIR):
+        OBS.write_curves_csvs(output, metadata=metadata)
+
     summary_path = RUN_ARTIFACT_DIR / f"rsi_training_summary_{stamp}.json"
     latest_summary_path = RUN_ARTIFACT_DIR / "latest_rsi_training_summary.json"
     summary_json = json.dumps(summary, indent=2, sort_keys=True)
     summary_path.write_text(summary_json + "\n", encoding="utf-8")
     latest_summary_path.write_text(summary_json + "\n", encoding="utf-8")
 
-    if not WRITE_OBSERVABLE_ARTIFACTS:
-        return Path("disabled"), Path("disabled"), Path("disabled")
-
-    csv_dir = RUN_ARTIFACT_DIR / f"rsi_observable_csv_{stamp}"
-    latest_csv_dir = RUN_ARTIFACT_DIR / "latest_rsi_observable_csv"
-    for output in (csv_dir, latest_csv_dir, OBSERVABLE_CSV_DIR):
-        OBS.write_curves_csvs(output, metadata=metadata)
-
     plot_path = RUN_ARTIFACT_DIR / f"rsi_observable_plot_{stamp}.png"
     latest_plot_path = RUN_ARTIFACT_DIR / "latest_rsi_observable_plot.png"
-    if not WRITE_OBSERVABLE_PLOTS:
-        return csv_dir, Path("disabled"), Path("disabled")
     _write_observable_plot(plot_path)
     shutil.copy2(plot_path, latest_plot_path)
     comparison_dir = RUN_ARTIFACT_DIR / f"rsi_observable_comparisons_{stamp}"
@@ -699,252 +614,6 @@ def compute_weight_norm_target_regularizer(module):
     return penalty, metrics
 
 
-def _linear_ramp_target(step, until_step, start, end):
-    if until_step <= 0:
-        return end
-    alpha = min(max(step / until_step, 0.0), 1.0)
-    return start + alpha * (end - start)
-
-
-def compute_mlp_l2_growth_regularizer(module, step):
-    if hasattr(module, "_orig_mod"):
-        module = module._orig_mod
-    target = _linear_ramp_target(
-        step,
-        MLP_L2_GROWTH_REG_UNTIL_STEP,
-        MLP_L2_GROWTH_REG_START_TARGET,
-        MLP_L2_GROWTH_REG_END_TARGET,
-    )
-    target_t = torch.tensor(target, device=device, dtype=torch.float32)
-    penalties = []
-    norms = []
-    selected_layers = set(MLP_L2_GROWTH_REG_LAYERS)
-    for layer_idx, block in enumerate(module.transformer.h):
-        if layer_idx not in selected_layers:
-            continue
-        l2_sq = torch.zeros((), device=target_t.device, dtype=torch.float32)
-        for param in (block.mlp.c_fc.weight, block.mlp.c_proj.weight):
-            l2_sq = l2_sq + param.float().square().sum()
-        norm_value = l2_sq.clamp_min(1e-12).sqrt()
-        norms.append(norm_value)
-        penalties.append(((target_t - norm_value).clamp_min(0.0) / target_t.clamp_min(1.0)).square())
-
-    if not penalties:
-        zero = torch.zeros((), device=device, dtype=torch.float32)
-        return zero, {}
-
-    norms_t = torch.stack(norms)
-    penalty = MLP_L2_GROWTH_REG_COEF * torch.stack(penalties).mean()
-    metrics = {
-        "observable_reg_mlp_l2_growth.loss": penalty.detach().item(),
-        "observable_reg_mlp_l2_growth.target": float(target),
-        "observable_reg_mlp_l2_growth.mean_l2": norms_t.detach().mean().item(),
-        "observable_reg_mlp_l2_growth.min_l2": norms_t.detach().min().item(),
-        "observable_reg_mlp_l2_growth.max_l2": norms_t.detach().max().item(),
-        "observable_reg_mlp_l2_growth.num_under_target": (norms_t.detach() < target_t).float().sum().item(),
-    }
-    return penalty, metrics
-
-
-def compute_attention_head_l2_growth_regularizer(module, step, projections, prefix):
-    if hasattr(module, "_orig_mod"):
-        module = module._orig_mod
-    target = _linear_ramp_target(
-        step,
-        ATTN_HEAD_L2_GROWTH_REG_UNTIL_STEP,
-        ATTN_HEAD_L2_GROWTH_REG_START_TARGET,
-        ATTN_HEAD_L2_GROWTH_REG_END_TARGET,
-    )
-    target_t = torch.tensor(target, device=device, dtype=torch.float32)
-    selected_layers = set(ATTN_HEAD_L2_GROWTH_REG_LAYERS)
-    penalties = []
-    norms = []
-    for layer_idx, block in enumerate(module.transformer.h):
-        if layer_idx not in selected_layers:
-            continue
-        attn = block.attn
-        for proj in projections:
-            param = getattr(attn, proj).weight.float()
-            head_count = attn.n_head if proj == "c_q" else attn.n_kv_head
-            head_dim = attn.head_dim
-            head_weights = param.view(head_count, head_dim, -1)
-            head_norms = head_weights.square().sum(dim=(1, 2)).clamp_min(1e-12).sqrt()
-            norms.append(head_norms)
-            penalties.append(((target_t - head_norms).clamp_min(0.0) / target_t.clamp_min(1.0)).square())
-
-    if not penalties:
-        zero = torch.zeros((), device=device, dtype=torch.float32)
-        return zero, {}
-
-    norms_t = torch.cat(norms)
-    penalty = ATTN_HEAD_L2_GROWTH_REG_COEF * torch.cat(penalties).mean()
-    metrics = {
-        f"observable_reg_{prefix}.loss": penalty.detach().item(),
-        f"observable_reg_{prefix}.target": float(target),
-        f"observable_reg_{prefix}.mean_l2": norms_t.detach().mean().item(),
-        f"observable_reg_{prefix}.min_l2": norms_t.detach().min().item(),
-        f"observable_reg_{prefix}.max_l2": norms_t.detach().max().item(),
-        f"observable_reg_{prefix}.num_under_target": (norms_t.detach() < target_t).float().sum().item(),
-    }
-    return penalty, metrics
-
-
-def compute_attention_entropy_regularizer():
-    if not ATTENTION_ENTROPY_REG_VALUES:
-        raise ValueError("Attention entropy regularizer captured no layer values")
-    if len(ATTENTION_ENTROPY_REG_VALUES) != DEPTH:
-        raise ValueError(
-            f"Attention entropy regularizer expected {DEPTH} layers, "
-            f"captured {len(ATTENTION_ENTROPY_REG_VALUES)}"
-        )
-    entropies = torch.stack(ATTENTION_ENTROPY_REG_VALUES)
-    penalty = ATTN_ENTROPY_REG_COEF * entropies.mean()
-    return penalty, {
-        "observable_reg_attention_entropy.loss": penalty.detach().item(),
-        "observable_reg_attention_entropy.mean": entropies.detach().mean().item(),
-        "observable_reg_attention_entropy.min": entropies.detach().min().item(),
-        "observable_reg_attention_entropy.max": entropies.detach().max().item(),
-        "observable_reg_attention_entropy.layer_count": float(entropies.numel()),
-    }
-
-
-def _tensor_observable_stat(tensor, statistic):
-    value = tensor.float()
-    if statistic == "l1":
-        return value.abs().sum()
-    if statistic == "l2":
-        return value.square().sum().clamp_min(1e-12).sqrt()
-    if statistic == "abs_max":
-        return value.abs().max()
-    if statistic == "mean":
-        return value.mean()
-    if statistic == "rms":
-        return value.square().mean().clamp_min(1e-12).sqrt()
-    if statistic == "std":
-        return value.std()
-    if statistic == "zero_fraction":
-        scale = value.detach().square().mean().sqrt().clamp_min(1e-6) * 0.01
-        return torch.exp(-value.abs() / scale).mean()
-    if statistic == "nan_fraction":
-        # A finite run has no differentiable NaN count; this zero-valued barrier
-        # keeps the trial explicit without introducing NaNs into the objective.
-        return torch.nan_to_num(value).sum() * 0.0
-    raise ValueError(f"Unsupported trajectory statistic: {statistic}")
-
-
-def compute_parameter_trajectory_value(module, observable):
-    if hasattr(module, "_orig_mod"):
-        module = module._orig_mod
-    observable = _canonical_reg_observable(observable)
-
-    match = re.fullmatch(
-        r"observable_param_(l1|l2|abs_max|mean|rms|std|zero_fraction|nan_fraction)\."
-        r"layer_(\d+)\.attn\.(c_q|c_k|c_v)\.weight",
-        observable,
-    )
-    if match:
-        statistic, layer, projection = match.groups()
-        param = getattr(module.transformer.h[int(layer)].attn, projection).weight
-        return _tensor_observable_stat(param, statistic)
-
-    match = re.fullmatch(
-        r"observable_param_(l1|l2)\.layer_(\d+)\.mlp\.(c_fc|c_proj)\.weight",
-        observable,
-    )
-    if match:
-        statistic, layer, projection = match.groups()
-        param = getattr(module.transformer.h[int(layer)].mlp, projection).weight
-        return _tensor_observable_stat(param, statistic)
-
-    match = re.fullmatch(
-        r"observable_param_head_l2\.layer_(\d+)\.attn\.(c_q|c_k|c_v)\.head_(\d+)\.weight",
-        observable,
-    )
-    if match:
-        layer, projection, head = match.groups()
-        attn = module.transformer.h[int(layer)].attn
-        param = getattr(attn, projection).weight.float()
-        head_count = attn.n_head if projection == "c_q" else attn.n_kv_head
-        head_weights = param.view(head_count, attn.head_dim, -1)
-        return _tensor_observable_stat(head_weights[int(head)], "l2")
-
-    match = re.fullmatch(r"observable_mlp_weight_(l1|l2)\.layer_(\d+)", observable)
-    if match:
-        statistic, layer = match.groups()
-        mlp = module.transformer.h[int(layer)].mlp
-        flat = torch.cat((mlp.c_fc.weight.float().flatten(), mlp.c_proj.weight.float().flatten()))
-        return _tensor_observable_stat(flat, statistic)
-
-    match = re.fullmatch(r"observable_weight_(l1|l2)\.layer_(\d+)(?:\.(\w+))?", observable)
-    if match:
-        statistic, layer, component = match.groups()
-        target_group = f"layer_{int(layer):02d}" + (f".{component}" if component else "")
-        tensors = [
-            param.float()
-            for name, param in module.named_parameters()
-            if _weight_observable_group(name) == target_group
-        ]
-        if tensors:
-            if statistic == "l1":
-                return torch.stack([tensor.abs().sum() for tensor in tensors]).sum()
-            return torch.stack([tensor.square().sum() for tensor in tensors]).sum().clamp_min(1e-12).sqrt()
-    return None
-
-
-def compute_trajectory_regularizer(module, step, task_loss):
-    if not TRAJECTORY_REG_OBSERVABLE or step > TRAJECTORY_REG_UNTIL_STEP:
-        return task_loss.new_zeros(()), {}
-    if TRAJECTORY_REG_MODE == "loss_acceleration":
-        penalty = TRAJECTORY_REG_COEF * task_loss
-        return penalty, {
-            "observable_trajectory_reg.loss": penalty.detach().item(),
-            "observable_trajectory_reg.proxy": 1.0,
-        }
-
-    current = REG_CAPTURE.value
-    if current is None:
-        current = compute_parameter_trajectory_value(module, TRAJECTORY_REG_OBSERVABLE)
-    if current is None:
-        raise ValueError(f"No differentiable trajectory value for {TRAJECTORY_REG_OBSERVABLE}")
-    if not TRAJECTORY_REG_TARGETS:
-        raise ValueError("TRAJECTORY_REG_CURVE_FILE is required for trajectory mode")
-    target_idx = min(step + TRAJECTORY_REG_LEAD_STEPS, len(TRAJECTORY_REG_TARGETS) - 1)
-    target = current.new_tensor(TRAJECTORY_REG_TARGETS[target_idx])
-    scale = current.new_tensor(TRAJECTORY_REG_SCALE).clamp_min(1e-6)
-    penalty = TRAJECTORY_REG_COEF * ((current - target) / scale).square()
-    observables = {
-        "observable_trajectory_reg.loss": penalty.detach().item(),
-        "observable_trajectory_reg.current": current.detach().item(),
-        "observable_trajectory_reg.target": target.detach().item(),
-        "observable_trajectory_reg.scale": float(TRAJECTORY_REG_SCALE),
-    }
-    if TRAJECTORY_REG_OBSERVABLE_2 and step <= TRAJECTORY_REG_UNTIL_STEP:
-        if TRAJECTORY_REG_MODE_2 == "loss_acceleration":
-            penalty_2 = TRAJECTORY_REG_COEF_2 * task_loss
-            observables["observable_trajectory_reg_2.proxy"] = 1.0
-        else:
-            current_2 = REG_CAPTURE_2.value
-            if current_2 is None:
-                current_2 = compute_parameter_trajectory_value(module, TRAJECTORY_REG_OBSERVABLE_2)
-            if current_2 is None:
-                raise ValueError(f"No differentiable trajectory value for {TRAJECTORY_REG_OBSERVABLE_2}")
-            if not TRAJECTORY_REG_TARGETS_2:
-                raise ValueError("TRAJECTORY_REG_CURVE_FILE_2 is required for second trajectory mode")
-            target_idx_2 = min(step + TRAJECTORY_REG_LEAD_STEPS, len(TRAJECTORY_REG_TARGETS_2) - 1)
-            target_2 = current_2.new_tensor(TRAJECTORY_REG_TARGETS_2[target_idx_2])
-            scale_2 = current_2.new_tensor(TRAJECTORY_REG_SCALE_2).clamp_min(1e-6)
-            penalty_2 = TRAJECTORY_REG_COEF_2 * ((current_2 - target_2) / scale_2).square()
-            observables.update({
-                "observable_trajectory_reg_2.current": current_2.detach().item(),
-                "observable_trajectory_reg_2.target": target_2.detach().item(),
-                "observable_trajectory_reg_2.scale": float(TRAJECTORY_REG_SCALE_2),
-            })
-        observables["observable_trajectory_reg_2.loss"] = penalty_2.detach().item()
-        penalty = penalty + penalty_2
-        observables["observable_trajectory_reg.loss"] = penalty.detach().item()
-    return penalty, observables
-
-
 @torch.no_grad()
 def compute_gradient_norm(module):
     grad_l2_sq = torch.zeros((), device=device, dtype=torch.float32)
@@ -1055,60 +724,40 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
+@torch.no_grad()
 def observe_attention_distribution(prefix, q, k, window_size, sample_tokens=64):
     """Sampled causal attention entropy probe for layer diagnostics."""
     try:
-        track_grad = ATTENTION_ENTROPY_REG_CAPTURE_ACTIVE or any(
-            capture.wants(f"{prefix}.{suffix}")
-            for capture in REG_CAPTURES
-            for suffix in (
-                "attn_entropy",
-                "attn_entropy_norm",
-                "attn_max_prob",
-                "sink_attention_mass",
-                "attn_head_sink_max",
-                "attn_norm",
-                "attn_outlier_ratio",
-            )
-        )
-        with nullcontext() if track_grad else torch.no_grad():
-            q0 = q[0].float().transpose(0, 1) if track_grad else q[0].detach().float().transpose(0, 1)
-            k0 = k[0].float().transpose(0, 1) if track_grad else k[0].detach().float().transpose(0, 1)
-            if k0.size(0) != q0.size(0):
-                repeat = q0.size(0) // k0.size(0)
-                k0 = k0.repeat_interleave(repeat, dim=0)
-            total_tokens = q0.size(1)
-            q_count = min(sample_tokens, total_tokens)
-            q_start = total_tokens - q_count
-            q_sample = q0[:, q_start:, :]
-            scores = torch.matmul(q_sample, k0.transpose(-2, -1)) / (q_sample.size(-1) ** 0.5)
-            query_positions = torch.arange(q_start, total_tokens, device=scores.device)[:, None]
-            key_positions = torch.arange(total_tokens, device=scores.device)[None, :]
-            visible = key_positions <= query_positions
-            left_window = window_size[0] if isinstance(window_size, tuple) else window_size
-            if left_window is not None and left_window > 0 and left_window < total_tokens:
-                visible = visible & (key_positions >= (query_positions - left_window + 1))
-            scores = scores.masked_fill(~visible.unsqueeze(0), float("-inf"))
-            probs = torch.softmax(scores, dim=-1)
-            entropy = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)
-            if ATTENTION_ENTROPY_REG_CAPTURE_ACTIVE:
-                ATTENTION_ENTROPY_REG_VALUES.append(entropy.mean())
-            support = visible.sum(dim=-1).float().clamp_min(1)
-            sink_mass_by_head = probs[..., 0].mean(dim=-1)
-            values = {
-                "attn_entropy": entropy.mean(),
-                "attn_entropy_norm": (entropy / support.log().clamp_min(1e-6)).mean(),
-                "attn_max_prob": probs.max(dim=-1).values.mean(),
-                "sink_attention_mass": sink_mass_by_head.mean(),
-                "attn_head_sink_max": sink_mass_by_head.max(),
-                "attn_norm": probs.square().sum(dim=-1).sqrt().mean(),
-                "attn_outlier_ratio": (probs.max(dim=-1).values * support.unsqueeze(0)).mean(),
-            }
-            for suffix, value in values.items():
-                if OBSERVE_LAYER_PROBES:
-                    OBS.add(f"{prefix}.{suffix}", value)
-                for capture in REG_CAPTURES:
-                    capture.add(f"{prefix}.{suffix}", value)
+        q0 = q[0].detach().float().transpose(0, 1)  # H, T, D
+        k0 = k[0].detach().float().transpose(0, 1)  # H_kv, T, D
+        if k0.size(0) != q0.size(0):
+            repeat = q0.size(0) // k0.size(0)
+            k0 = k0.repeat_interleave(repeat, dim=0)
+        total_tokens = q0.size(1)
+        q_count = min(sample_tokens, total_tokens)
+        q_start = total_tokens - q_count
+        q_sample = q0[:, q_start:, :]
+        scores = torch.matmul(q_sample, k0.transpose(-2, -1)) / (q_sample.size(-1) ** 0.5)
+        query_positions = torch.arange(q_start, total_tokens, device=scores.device)[:, None]
+        key_positions = torch.arange(total_tokens, device=scores.device)[None, :]
+        visible = key_positions <= query_positions
+        left_window = window_size[0] if isinstance(window_size, tuple) else window_size
+        if left_window is not None and left_window > 0 and left_window < total_tokens:
+            visible = visible & (key_positions >= (query_positions - left_window + 1))
+        scores = scores.masked_fill(~visible.unsqueeze(0), float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        entropy = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)
+        support = visible.sum(dim=-1).float().clamp_min(1)
+        sink_mass_by_head = probs[..., 0].mean(dim=-1)
+        attn_norm = probs.square().sum(dim=-1).sqrt()
+        attn_outlier_ratio = probs.max(dim=-1).values * support.unsqueeze(0)
+        OBS.add(f"{prefix}.attn_entropy", entropy.mean())
+        OBS.add(f"{prefix}.attn_entropy_norm", (entropy / support.log().clamp_min(1e-6)).mean())
+        OBS.add(f"{prefix}.attn_max_prob", probs.max(dim=-1).values.mean())
+        OBS.add(f"{prefix}.sink_attention_mass", sink_mass_by_head.mean())
+        OBS.add(f"{prefix}.attn_head_sink_max", sink_mass_by_head.max())
+        OBS.add(f"{prefix}.attn_norm", attn_norm.mean())
+        OBS.add(f"{prefix}.attn_outlier_ratio", attn_outlier_ratio.mean())
     except Exception:
         return
 
@@ -1182,26 +831,12 @@ class CausalSelfAttention(nn.Module):
         # QK-norm refinement: normalize BEFORE rotary instead of after
         q, k = norm(q), norm(k)
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        if OBSERVE_LAYER_PROBES or any(c.wants_layer(self.layer_idx) for c in REG_CAPTURES) or ATTENTION_ENTROPY_REG_CAPTURE_ACTIVE:
+        if OBSERVE_LAYER_PROBES:
             prefix = f"layer_{self.layer_idx}"
-            if OBSERVE_LAYER_PROBES:
-                OBS.add_norms(f"{prefix}.q", q)
-                OBS.add_norms(f"{prefix}.k", k)
-                OBS.add_norms(f"{prefix}.v", v)
-            for capture in REG_CAPTURES:
-                capture.add_norms(f"{prefix}.q", q)
-                capture.add_norms(f"{prefix}.k", k)
-                capture.add_norms(f"{prefix}.v", v)
-            attention_probe_prefixes = (
-                f"{prefix}.attn_",
-                f"{prefix}.sink_attention_mass",
-            )
-            if (
-                OBSERVE_LAYER_PROBES
-                or any(c.observable.startswith(attention_probe_prefixes) for c in REG_CAPTURES)
-                or ATTENTION_ENTROPY_REG_CAPTURE_ACTIVE
-            ):
-                observe_attention_distribution(prefix, q, k, window_size)
+            OBS.add_norms(f"{prefix}.q", q)
+            OBS.add_norms(f"{prefix}.k", k)
+            OBS.add_norms(f"{prefix}.v", v)
+            observe_attention_distribution(prefix, q, k, window_size)
 
         # Replaces the previous direct flash_attn_func call; default SDPA is less
         # optimized but avoids the H200 native-extension segfault path.
@@ -1211,9 +846,6 @@ class CausalSelfAttention(nn.Module):
 
         # Head-level MoE: per-head routing gate on all layers
         head_gates = 2.0 * torch.sigmoid(self.head_gate(x[..., :self.ve_gate_channels]))
-        if OBSERVE_LAYER_PROBES or any(c.wants(f"layer_{self.layer_idx}.head_gate_mean") for c in REG_CAPTURES):
-            for capture in REG_CAPTURES:
-                capture.add(f"layer_{self.layer_idx}.head_gate_mean", head_gates)
         if OBSERVE_LAYER_PROBES:
             OBS.add(f"layer_{self.layer_idx}.head_gate_mean", head_gates)
         y = y * head_gates.unsqueeze(-1)
@@ -1221,8 +853,6 @@ class CausalSelfAttention(nn.Module):
         y = y.contiguous().view(B, T, -1)
         if OBSERVE_LAYER_PROBES:
             OBS.add_norms(f"layer_{self.layer_idx}.attn_out", y)
-        for capture in REG_CAPTURES:
-            capture.add_norms(f"layer_{self.layer_idx}.attn_out", y)
         y = self.c_proj(y)
         return y
 
@@ -1244,10 +874,6 @@ class MLP(nn.Module):
             OBS.add_norms(f"layer_{self.layer_idx}.mlp_pre", h_pre)
             OBS.add_norms(f"layer_{self.layer_idx}.mlp_act", h_act)
             OBS.add_norms(f"layer_{self.layer_idx}.mlp_out", h)
-        for capture in REG_CAPTURES:
-            capture.add_norms(f"layer_{self.layer_idx}.mlp_pre", h_pre)
-            capture.add_norms(f"layer_{self.layer_idx}.mlp_act", h_act)
-            capture.add_norms(f"layer_{self.layer_idx}.mlp_out", h)
         return h
 
 
@@ -1926,15 +1552,6 @@ OBSERVE_LAYER_PROBES = os.environ.get("OBSERVE_LAYER_PROBES", "0") == "1"
 OBSERVE_HESSIAN_EIGENVALUES = os.environ.get("OBSERVE_HESSIAN_EIGENVALUES", "0") == "1"
 OBSERVE_REST100_ATTENTION_HEAD_L2 = os.environ.get("OBSERVE_REST100_ATTENTION_HEAD_L2", "0") == "1"
 PRINT_OBSERVABLE_LINES = os.environ.get("PRINT_OBSERVABLE_LINES", "0") == "1"
-
-
-def _parse_int_list_env(name, default):
-    value = os.environ.get(name, default)
-    if not value.strip():
-        return tuple()
-    return tuple(int(part.strip()) for part in value.split(",") if part.strip())
-
-
 HESSIAN_EVERY = int(os.environ.get("HESSIAN_EVERY", "200"))
 if HESSIAN_EVERY <= 0:
     raise ValueError(f"HESSIAN_EVERY must be positive, got {HESSIAN_EVERY}")
@@ -1948,35 +1565,12 @@ WEIGHT_NORM_TARGET_REG = os.environ.get("WEIGHT_NORM_TARGET_REG", "0") == "1"
 WEIGHT_NORM_TARGET = float(os.environ.get("WEIGHT_NORM_TARGET", "350000"))
 WEIGHT_NORM_TARGET_REG_UNTIL_STEP = int(os.environ.get("WEIGHT_NORM_TARGET_REG_UNTIL_STEP", "750"))
 WEIGHT_NORM_TARGET_REG_COEF = float(os.environ.get("WEIGHT_NORM_TARGET_REG_COEF", "100"))
-MLP_L2_GROWTH_REG = os.environ.get("MLP_L2_GROWTH_REG", "0") == "1"
-MLP_L2_GROWTH_REG_LAYERS = _parse_int_list_env("MLP_L2_GROWTH_REG_LAYERS", "0,1,2")
-MLP_L2_GROWTH_REG_UNTIL_STEP = int(os.environ.get("MLP_L2_GROWTH_REG_UNTIL_STEP", "750"))
-MLP_L2_GROWTH_REG_COEF = float(os.environ.get("MLP_L2_GROWTH_REG_COEF", "1.0"))
-MLP_L2_GROWTH_REG_START_TARGET = float(os.environ.get("MLP_L2_GROWTH_REG_START_TARGET", "55"))
-MLP_L2_GROWTH_REG_END_TARGET = float(os.environ.get("MLP_L2_GROWTH_REG_END_TARGET", "165"))
-ATTN_V_HEAD_L2_GROWTH_REG = os.environ.get("ATTN_V_HEAD_L2_GROWTH_REG", "0") == "1"
-ATTN_QKV_HEAD_L2_GROWTH_REG = os.environ.get("ATTN_QKV_HEAD_L2_GROWTH_REG", "0") == "1"
-ATTN_HEAD_L2_GROWTH_REG_LAYERS = _parse_int_list_env("ATTN_HEAD_L2_GROWTH_REG_LAYERS", "1,2,3,4,6")
-ATTN_HEAD_L2_GROWTH_REG_UNTIL_STEP = int(os.environ.get("ATTN_HEAD_L2_GROWTH_REG_UNTIL_STEP", "750"))
-ATTN_HEAD_L2_GROWTH_REG_COEF = float(os.environ.get("ATTN_HEAD_L2_GROWTH_REG_COEF", "1.0"))
-ATTN_HEAD_L2_GROWTH_REG_START_TARGET = float(os.environ.get("ATTN_HEAD_L2_GROWTH_REG_START_TARGET", "11"))
-ATTN_HEAD_L2_GROWTH_REG_END_TARGET = float(os.environ.get("ATTN_HEAD_L2_GROWTH_REG_END_TARGET", "28"))
-ATTN_ENTROPY_REG = os.environ.get("ATTN_ENTROPY_REG", "0") == "1"
-ATTN_ENTROPY_REG_UNTIL_STEP = int(os.environ.get("ATTN_ENTROPY_REG_UNTIL_STEP", "750"))
-ATTN_ENTROPY_REG_COEF = float(os.environ.get("ATTN_ENTROPY_REG_COEF", "0.01"))
 if WEIGHT_NORM_TARGET <= 0:
     raise ValueError(f"WEIGHT_NORM_TARGET must be positive, got {WEIGHT_NORM_TARGET}")
 if WEIGHT_NORM_TARGET_REG_UNTIL_STEP < 0:
     raise ValueError(
         f"WEIGHT_NORM_TARGET_REG_UNTIL_STEP must be non-negative, got {WEIGHT_NORM_TARGET_REG_UNTIL_STEP}"
     )
-for name, value in (
-    ("MLP_L2_GROWTH_REG_UNTIL_STEP", MLP_L2_GROWTH_REG_UNTIL_STEP),
-    ("ATTN_HEAD_L2_GROWTH_REG_UNTIL_STEP", ATTN_HEAD_L2_GROWTH_REG_UNTIL_STEP),
-    ("ATTN_ENTROPY_REG_UNTIL_STEP", ATTN_ENTROPY_REG_UNTIL_STEP),
-):
-    if value < 0:
-        raise ValueError(f"{name} must be non-negative, got {value}")
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -2076,7 +1670,7 @@ for group in optimizer.param_groups:
         if group.get("demon_beta1", False):
             adam_demon_groups.append((group, group["betas"][1]))
 
-if OBSERVE_LAYER_PROBES or OBSERVE_HESSIAN_EIGENVALUES or any(c.enabled for c in REG_CAPTURES) or ATTN_ENTROPY_REG:
+if OBSERVE_LAYER_PROBES or OBSERVE_HESSIAN_EIGENVALUES:
     print("Observable Python/autograd probes enabled; torch.compile disabled for probe collection.")
 else:
     model = torch.compile(model, dynamic=False, mode="max-autotune", fullgraph=True)
@@ -2218,28 +1812,10 @@ while True:
     t0 = time.time()
     train_accuracy_f = None
     weight_norm_target_reg_observables = {}
-    experimental_reg_observables = {}
     for _micro_step in range(grad_accum_steps):
-        global_entropy_reg_active = ATTN_ENTROPY_REG and step < ATTN_ENTROPY_REG_UNTIL_STEP
-        ATTENTION_ENTROPY_REG_VALUES.clear()
-        ATTENTION_ENTROPY_REG_CAPTURE_ACTIVE = global_entropy_reg_active
-        for capture in REG_CAPTURES:
-            capture.clear()
         with autocast_ctx:
             loss, train_accuracy = model(x, y, return_accuracy=True)
-            ATTENTION_ENTROPY_REG_CAPTURE_ACTIVE = False
             task_loss = loss
-            if global_entropy_reg_active:
-                reg_loss, reg_observables = compute_attention_entropy_regularizer()
-                loss = loss + reg_loss
-                experimental_reg_observables.update(reg_observables)
-            elif ATTN_ENTROPY_REG:
-                experimental_reg_observables.update(
-                    {
-                        "observable_reg_attention_entropy.loss": 0.0,
-                        "observable_reg_attention_entropy.layer_count": 0.0,
-                    }
-                )
             if WEIGHT_NORM_TARGET_REG and step <= WEIGHT_NORM_TARGET_REG_UNTIL_STEP:
                 weight_norm_target_reg_loss, weight_norm_target_reg_observables = (
                     compute_weight_norm_target_regularizer(model)
@@ -2251,41 +1827,6 @@ while True:
                     "observable_weight_norm_target_reg.target": WEIGHT_NORM_TARGET,
                     "observable_weight_norm_target_reg.num_under_target": 0.0,
                 }
-            if MLP_L2_GROWTH_REG and step <= MLP_L2_GROWTH_REG_UNTIL_STEP:
-                reg_loss, reg_observables = compute_mlp_l2_growth_regularizer(model, step)
-                loss = loss + reg_loss
-                experimental_reg_observables.update(reg_observables)
-            elif MLP_L2_GROWTH_REG:
-                experimental_reg_observables.update({"observable_reg_mlp_l2_growth.loss": 0.0})
-            if ATTN_V_HEAD_L2_GROWTH_REG and step <= ATTN_HEAD_L2_GROWTH_REG_UNTIL_STEP:
-                reg_loss, reg_observables = compute_attention_head_l2_growth_regularizer(
-                    model,
-                    step,
-                    ("c_v",),
-                    "attn_v_head_l2_growth",
-                )
-                loss = loss + reg_loss
-                experimental_reg_observables.update(reg_observables)
-            elif ATTN_V_HEAD_L2_GROWTH_REG:
-                experimental_reg_observables.update({"observable_reg_attn_v_head_l2_growth.loss": 0.0})
-            if ATTN_QKV_HEAD_L2_GROWTH_REG and step <= ATTN_HEAD_L2_GROWTH_REG_UNTIL_STEP:
-                reg_loss, reg_observables = compute_attention_head_l2_growth_regularizer(
-                    model,
-                    step,
-                    ("c_q", "c_k", "c_v"),
-                    "attn_qkv_head_l2_growth",
-                )
-                loss = loss + reg_loss
-                experimental_reg_observables.update(reg_observables)
-            elif ATTN_QKV_HEAD_L2_GROWTH_REG:
-                experimental_reg_observables.update({"observable_reg_attn_qkv_head_l2_growth.loss": 0.0})
-            trajectory_reg_loss, trajectory_reg_observables = compute_trajectory_regularizer(
-                model,
-                step,
-                task_loss,
-            )
-            loss = loss + trajectory_reg_loss
-            experimental_reg_observables.update(trajectory_reg_observables)
         train_accuracy_f = train_accuracy.item()
         train_loss = task_loss.detach()
         loss = loss / grad_accum_steps
@@ -2423,7 +1964,7 @@ while True:
         val_accuracy=val_accuracy_f,
         gradient_norm=gradient_norm_f,
         weight_observables=weight_observables,
-        extra_observables={**hessian_observables, **experimental_reg_observables},
+        extra_observables=hessian_observables,
         dt=dt,
         tok_per_sec=tok_per_sec,
         lrm_muon=lrm_muon,
@@ -2483,7 +2024,6 @@ summary = {
     "max_train_steps": MAX_TRAIN_STEPS,
     "num_params_M": num_params / 1e6,
     "depth": DEPTH,
-    "seed": _SEED,
     "model_config": asdict(config),
     "observe_layer_probes": OBSERVE_LAYER_PROBES,
     "observe_rest100_attention_head_l2": OBSERVE_REST100_ATTENTION_HEAD_L2,
@@ -2492,27 +2032,6 @@ summary = {
     "weight_norm_target": WEIGHT_NORM_TARGET,
     "weight_norm_target_reg_until_step": WEIGHT_NORM_TARGET_REG_UNTIL_STEP,
     "weight_norm_target_reg_coef": WEIGHT_NORM_TARGET_REG_COEF,
-    "mlp_l2_growth_reg": MLP_L2_GROWTH_REG,
-    "mlp_l2_growth_reg_layers": list(MLP_L2_GROWTH_REG_LAYERS),
-    "mlp_l2_growth_reg_until_step": MLP_L2_GROWTH_REG_UNTIL_STEP,
-    "mlp_l2_growth_reg_coef": MLP_L2_GROWTH_REG_COEF,
-    "mlp_l2_growth_reg_start_target": MLP_L2_GROWTH_REG_START_TARGET,
-    "mlp_l2_growth_reg_end_target": MLP_L2_GROWTH_REG_END_TARGET,
-    "attn_v_head_l2_growth_reg": ATTN_V_HEAD_L2_GROWTH_REG,
-    "attn_qkv_head_l2_growth_reg": ATTN_QKV_HEAD_L2_GROWTH_REG,
-    "attn_head_l2_growth_reg_layers": list(ATTN_HEAD_L2_GROWTH_REG_LAYERS),
-    "attn_head_l2_growth_reg_until_step": ATTN_HEAD_L2_GROWTH_REG_UNTIL_STEP,
-    "attn_head_l2_growth_reg_coef": ATTN_HEAD_L2_GROWTH_REG_COEF,
-    "attn_head_l2_growth_reg_start_target": ATTN_HEAD_L2_GROWTH_REG_START_TARGET,
-    "attn_head_l2_growth_reg_end_target": ATTN_HEAD_L2_GROWTH_REG_END_TARGET,
-    "attn_entropy_reg": ATTN_ENTROPY_REG,
-    "attn_entropy_reg_until_step": ATTN_ENTROPY_REG_UNTIL_STEP,
-    "attn_entropy_reg_coef": ATTN_ENTROPY_REG_COEF,
-    "trajectory_reg_observable": TRAJECTORY_REG_OBSERVABLE,
-    "trajectory_reg_mode": TRAJECTORY_REG_MODE,
-    "trajectory_reg_coef": TRAJECTORY_REG_COEF,
-    "trajectory_reg_until_step": TRAJECTORY_REG_UNTIL_STEP,
-    "trajectory_reg_lead_steps": TRAJECTORY_REG_LEAD_STEPS,
 }
 observable_csv_path, observable_plot_path, observable_figure_index_path = write_observable_artifacts(summary)
 

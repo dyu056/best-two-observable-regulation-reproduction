@@ -1,70 +1,56 @@
-# Best Two-Observable Regulation Reproduction
+# Unregularized Baseline — Comparison Branch
 
-A self-contained reproduction bundle for the best completed two-observable
-trajectory-regulation trial from an exhaustive observable-pair sweep.
+This branch contains the **baseline code and recorded baseline result** used to
+measure the improvement published on the repository's [`main`](../../tree/main)
+branch.
 
-## Result
+Both the baseline and winning pair were evaluated on a single **NVIDIA H200
+GPU**, using 2,000 training steps and seed 42.
+
+## Baseline result
 
 | Metric | Value |
 |---|---:|
-| Validation BPB | **0.931054588125949** |
-| Baseline validation BPB | 0.934416673352 |
-| Absolute improvement | **0.003362085226051** |
+| Baseline validation BPB | **0.9344166733521407** |
+| Winning pair validation BPB | 0.931054588125949 |
+| Improvement from baseline | **0.0033620852261917 BPB** |
 | Relative improvement | **0.3598%** |
-| Sweep row | 404 |
+| Steps | 2,000 |
 | Seed | 42 |
 
-The published winning run and its reproduction artifacts were generated on a single **NVIDIA H200 GPU**.
+## What differs from `main`
 
-The winning pair is:
+The baseline `train.py` is the historical pre-regulation source from parent
+project commit `4bc2743a` (`Add observable probes and result plots`). It contains
+no trajectory-regulation implementation. The `main` branch adds two-observable
+trajectory regulation and supplies the winning target curves:
 
-1. `val.layer_2.attn_out.l1`
-2. `train.layer_0.k.l1`
+- `val.layer_2.attn_out.l1`
+- `train.layer_0.k.l1`
 
-Both use normalized trajectory targets with coefficient `0.01`, a 100-step
-lead, and regulation through step 750. Training runs for 2,000 steps.
+This makes the GitHub branch comparison a direct code-level view of the baseline
+versus the published solution.
 
 ## Repository contents
 
-- `reproduce.py` — isolated, single-command launcher with the winning settings.
-- `train.py` — exact historical training source used by the winning sweep trial.
-- `curves/` — the two exact target trajectories.
-- `summary.json` — authoritative summary from the winning trial.
-- `train.log` — authoritative training log from the winning trial.
+- `train.py` — exact historical baseline training source.
+- `reproduce.py` — isolated launcher for the unregularized baseline.
+- `summary.json` — authoritative baseline result.
 - `prepare.py`, `lib.py`, `observable.py`, `data_split.json` — data/runtime support.
-- `SHA256SUMS.json` — SHA-256 manifest for the published bundle.
+- `SHA256SUMS.json` — integrity manifest for this branch.
 
-## Requirements
-
-- Linux with a CUDA-capable NVIDIA GPU (the recorded run used an NVIDIA H200)
-- Python 3.10+
-- A PyTorch build compatible with the installed CUDA driver
-
-Create an environment and install the Python dependencies:
+## Setup
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-For production GPU environments, install the appropriate PyTorch wheel for the
-machine before installing the remaining requirements.
-
-## Prepare data
-
-The training data and tokenizer are stored under `~/.cache/autoresearch/`:
-
-```bash
 python prepare.py
 ```
 
-`prepare.py` downloads the shard split specified by `data_split.json` and builds
-the tokenizer.
+The data and tokenizer are stored under `~/.cache/autoresearch/`.
 
-## Reproduce
-
-Run on a selected physical GPU, for example GPU 0:
+## Run the baseline
 
 ```bash
 python reproduce.py \
@@ -73,46 +59,22 @@ python reproduce.py \
   --output-dir rerun
 ```
 
-The run writes:
+Outputs are written to `rerun/train.log`, `rerun/summary.json`, and the isolated
+`rerun/work/` directory. Observable CSVs and plots are also generated because
+the recorded baseline had the layer and attention-head probes enabled.
 
-- `rerun/train.log`
-- `rerun/summary.json`
-- isolated working files under `rerun/work/`
+## Compare with the winning solution
 
-Compare `rerun/summary.json` with the published `summary.json`. Exact bitwise
-identity can depend on GPU model, CUDA/PyTorch versions, and kernel selection;
-the repository preserves the exact source, seed, curves, and hyperparameters.
+- [Baseline branch](../../tree/baseline)
+- [Winning solution (`main`)](../../tree/main)
+- [Full branch diff](../../compare/baseline...main)
 
-## Winning configuration
+## Source identity
+
+The baseline `train.py` SHA-256 is:
 
 ```text
-observable_1 = val.layer_2.attn_out.l1
-observable_2 = train.layer_0.k.l1
-mode_1 = trajectory
-mode_2 = trajectory
-coefficient_1 = 0.01
-coefficient_2 = 0.01
-lead_steps = 100
-until_step = 750
-seed = 42
-max_train_steps = 2000
-```
-
-## Integrity
-
-Verify the published files:
-
-```bash
-python - <<'PY'
-import hashlib, json
-from pathlib import Path
-root = Path('.')
-manifest = json.loads((root / 'SHA256SUMS.json').read_text())
-for name, expected in manifest.items():
-    actual = hashlib.sha256((root / name).read_bytes()).hexdigest()
-    assert actual == expected, f'{name}: {actual} != {expected}'
-print(f'Verified {len(manifest)} files')
-PY
+abf1107b09e2672d2439bceb8bf75d1d7a3a8ee7b4c4e1502d2bc21a43485dd2
 ```
 
 ## License
